@@ -29,6 +29,7 @@ Read the documentation at [https://github.com/KindDragon/vld/wiki](https://githu
 We encourage developers who've added their own features, or fixed bugs they've found, to contribute to the project. The full version-controlled source tree is available publicly via Git at the URL below. Feel free to clone from this URL and submit patches for consideration for inclusion in future versions. You can also issue pull requests for changes that you've made and would like to share.
 
 * [Source code](https://github.com/KindDragon/vld)
+* [Microsoft fork code](https://github.com/Azure/vld)
 
 Copyright © 2005-2017 VLD Team
 
