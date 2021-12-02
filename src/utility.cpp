@@ -425,14 +425,99 @@ BOOL IsModulePatched (HMODULE importmodule, moduleentry_t patchtable [], UINT ta
     return FALSE;
 }
 
+#define MAX_PAGES_PROTECT 2
+
+typedef struct PROTECT_INSTANCE_TAG
+{
+    DWORD old_protect[MAX_PAGES_PROTECT];
+    LPVOID address;
+    SIZE_T size;
+} PROTECT_INSTANCE;
+
+typedef struct PROTECT_INSTANCE_TAG* PROTECT_HANDLE;
+
+#ifdef _WIN64
+#define PAGE_MASK 0xFFFFFFFFFFFFF000
+#else
+#define PAGE_MASK 0xFFFFF000
+#endif
+
+#define PAGE_SIZE 0x1000
+
+static BOOL VLDVirtualProtect(PROTECT_HANDLE protect_handle, LPVOID address, SIZE_T size, DWORD protect)
+{
+    BOOL result = TRUE;
+    size_t page_count = 0;
+
+    // save the address and size so that we can restore in the same way
+    protect_handle->address = address;
+    protect_handle->size = size;
+
+    uintptr_t current_address = (uintptr_t)address;
+
+    // walk all pages while we still have size > 0
+    while ((size > 0) && (page_count < MAX_PAGES_PROTECT))
+    {
+        uintptr_t page_address = current_address & PAGE_MASK;
+        SIZE_T size_in_page = page_address + PAGE_SIZE - current_address;
+        SIZE_T size_to_protect = (size_in_page < size) ? size_in_page : size;
+
+        result = VirtualProtect((LPVOID)current_address, size_to_protect, protect, &protect_handle->old_protect[page_count]);
+        if (!result)
+        {
+            Report(L"%zu: !!! VirtualProtect FAILED when protecting for address=%p, size=%zu, with GetLastError()=%lu, protect_handle->address=%p, protect_handle->size=%zu",
+                __LINE__, current_address, size_to_protect,
+                GetLastError(),
+                protect_handle->address, protect_handle->size);
+        }
+        page_count++;
+        current_address += size_to_protect;
+        size -= size_to_protect;
+    }
+
+    return result;
+}
+
+static void VLDVirtualRestore(PROTECT_HANDLE protect_handle)
+{
+    size_t page_count = 0;
+    SIZE_T size = protect_handle->size;
+    uintptr_t current_address = (uintptr_t)protect_handle->address;
+
+    // walk all pages while we still have size > 0
+    while ((size > 0) && (page_count < MAX_PAGES_PROTECT))
+    {
+        uintptr_t page_address = current_address & PAGE_MASK;
+        SIZE_T size_in_page = page_address + PAGE_SIZE - current_address;
+        SIZE_T size_to_protect = (size_in_page < size) ? size_in_page : size;
+
+        DWORD dont_care;
+        if (!VirtualProtect((LPVOID)current_address, size_to_protect, protect_handle->old_protect[page_count], &dont_care))
+        {
+            static volatile DWORD lastError = GetLastError();
+            Report(L"%zu: !!! VirtualProtect FAILED when restoring for address=%p, size=%zu, with GetLastError()=%lu, protect_handle->old_protect[page_count]=%lu, protect_handle->address=%p, protect_handle->size=%zu",
+                __LINE__, current_address, size_to_protect,
+                GetLastError(), protect_handle->old_protect[page_count],
+                protect_handle->address, protect_handle->size);
+            abort();
+        }
+
+        page_count++;
+        current_address += size_to_protect;
+        size -= size_to_protect;
+    }
+
+}
+
 LPVOID FindRealCode(LPVOID pCode)
 {
     LPVOID result;
     if (pCode != NULL)
     {
-        // we need to make sure we can read the first 3 ULONG_PTRs
-        DWORD old_protect;
-        if (VirtualProtect(pCode, sizeof(ULONG_PTR) * 3, PAGE_EXECUTE_READ, &old_protect))
+        // we need to make sure we can read the first 7 ULONG_PTRs
+        PROTECT_INSTANCE protect_1;
+
+        if (VLDVirtualProtect(&protect_1, pCode, sizeof(ULONG_PTR) * 7, PAGE_EXECUTE_READ))
         {
             if (*(WORD*)pCode == 0x25ff) // JMP r/m32
             {
@@ -442,12 +527,14 @@ LPVOID FindRealCode(LPVOID pCode)
                 PBYTE pNextInst = (PBYTE)((ULONG_PTR)pCode + 6);
 
                 // now that we got the offset, make sure we can read the code at the offset
-                DWORD old_protect_2;
+                PROTECT_INSTANCE protect_2;
                 PBYTE addr = pNextInst + offset;
-                if (VirtualProtect(addr, sizeof(LPVOID), PAGE_EXECUTE_READ, &old_protect_2))
+
+                if (VLDVirtualProtect(&protect_2, (LPVOID*)addr, sizeof(LPVOID), PAGE_EXECUTE_READ))
                 {
-                    result = *(LPVOID*)(addr);
-                    (void)VirtualProtect(addr, sizeof(LPVOID), old_protect_2, &old_protect_2);
+                    pCode = *(LPVOID*)(addr);
+                    result = FindRealCode(pCode);
+                    VLDVirtualRestore(&protect_2);
                 }
                 else
                 {
@@ -456,12 +543,12 @@ LPVOID FindRealCode(LPVOID pCode)
 #else
                 DWORD addr = *((DWORD*)((ULONG_PTR)pCode + 2));
                 // now that we got the address to read, make sure we can read the code at the offset
-                DWORD old_protect_2;
-                if (VirtualProtect((LPVOID*)addr, sizeof(LPVOID), PAGE_EXECUTE_READ, &old_protect_2))
+                PROTECT_INSTANCE protect_2;
+                if (VLDVirtualProtect(&protect_2, (LPVOID)addr, sizeof(LPVOID), PAGE_EXECUTE_READ))
                 {
                     pCode = *(LPVOID*)(addr);
                     result = FindRealCode(pCode);
-                    (void)VirtualProtect((LPVOID*)addr, sizeof(LPVOID), old_protect_2, &old_protect_2);
+                    VLDVirtualRestore(&protect_2);
                 }
                 else
                 {
@@ -472,10 +559,19 @@ LPVOID FindRealCode(LPVOID pCode)
             else if (*(BYTE*)pCode == 0xE9) // JMP rel32
             {
                 // Relative next instruction
+                PROTECT_INSTANCE protect_2;
                 PBYTE pNextInst = (PBYTE)((ULONG_PTR)pCode + 5);
                 LONG offset = *((LONG*)((ULONG_PTR)pCode + 1));
-                pCode = (LPVOID*)(pNextInst + offset);
-                result = FindRealCode(pCode);
+                if (VLDVirtualProtect(&protect_2, pNextInst + offset, sizeof(LPVOID), PAGE_EXECUTE_READ))
+                {
+                    pCode = (LPVOID*)(pNextInst + offset);
+                    result = FindRealCode(pCode);
+                    VLDVirtualRestore(&protect_2);
+                }
+                else
+                {
+                    result = NULL;
+                }
             }
             else
             {
@@ -483,7 +579,7 @@ LPVOID FindRealCode(LPVOID pCode)
             }
 
             // restore the page protection state
-            (void)VirtualProtect(pCode, sizeof(ULONG_PTR) * 3, old_protect, &old_protect);
+            VLDVirtualRestore(&protect_1);
         }
         else
         {
@@ -596,6 +692,8 @@ BOOL PatchImport (HMODULE importmodule, moduleentry_t *patchModule)
     while (idte->FirstThunk != 0x0) {
         PCHAR importdllname = (PCHAR)R2VA(importmodule, idte->Name);
         UNREFERENCED_PARAMETER(importdllname);
+        HMODULE importdllbaseaddress = GetModuleHandleA(importdllname);
+        UNREFERENCED_PARAMETER(importdllbaseaddress);
 
         // Locate the import's IAT entry.
         IMAGE_THUNK_DATA *thunk = (IMAGE_THUNK_DATA*)R2VA(importmodule, idte->FirstThunk);
